@@ -1,113 +1,87 @@
 import os
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
+from typing import Annotated
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Importações de LangChain e outras
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_pinecone import Pinecone  # <<< MUDANÇA IMPORTANTE NA IMPORTAÇÃO
+from langchain_pinecone import Pinecone
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 
-# --- INICIALIZAÇÃO E CONFIGURAÇÃO ---
-
-# Carrega as variáveis de ambiente do arquivo .env (para rodar localmente)
-# No Render, ele usará as variáveis que você configurou no painel.
 load_dotenv()
 
-# Configura as chaves de API como variáveis de ambiente para que as bibliotecas as encontrem
 os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 os.environ["PINECONE_API_KEY"] = os.getenv("PINECONE_API_KEY")
-
-# Pega o nome do índice do Pinecone do ambiente
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 
-# Carrega os modelos de IA (usando o cache do Streamlit, mas aqui eles serão carregados na inicialização da API)
-embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+API_KEY = os.getenv("API_BACKEND_KEY")
+API_KEY_NAME = "X-Api-Key"
+
+api_key_header_scheme = Header(alias=API_KEY_NAME)
+
+
+async def api_key_auth(x_api_key: Annotated[str, api_key_header_scheme]):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Chave de API inválida ou ausente")
+
+
+embeddings_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.5)
 
-# Inicializa a aplicação FastAPI
-app = FastAPI(title="API do Chat RAG")
+app = FastAPI(title="RAG Chat API")
 
 
-# --- FUNÇÕES DE APOIO (PROCESSAMENTO DE PDF) ---
-
-def processar_texto_de_pdf(pdf_file):
-    """Lê o conteúdo de um arquivo PDF e retorna como texto."""
-    texto = ""
+def process_pdf_text(pdf_file):
+    full_text = ""
     try:
-        leitor_pdf = PdfReader(pdf_file)
-        for pagina in leitor_pdf.pages:
-            texto_pagina = pagina.extract_text()
-            if texto_pagina:
-                texto += texto_pagina
+        pdf_reader = PdfReader(pdf_file)
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                full_text += page_text
     except Exception as e:
-        # Em caso de erro, lança uma exceção HTTP que o FastAPI entende.
         raise HTTPException(status_code=500, detail=f"Erro ao ler o arquivo PDF: {e}")
-    return texto
+    return full_text
 
 
-def criar_chunks(texto):
-    """Quebra um texto longo em pedaços menores (chunks)."""
+def create_text_chunks(full_text):
     text_splitter = CharacterTextSplitter(separator='\n', chunk_size=1000, chunk_overlap=200, length_function=len)
-    return text_splitter.split_text(texto)
+    return text_splitter.split_text(full_text)
 
 
-# --- ENDPOINTS DA API (AS "PORTAS" DE ENTRADA) ---
-
-@app.post("/upload-and-process/")
+@app.post("/upload-and-process/", dependencies=[Depends(api_key_auth)])
 async def upload_and_process(file: UploadFile = File(...)):
-    """
-    Endpoint para receber um arquivo PDF, processá-lo e adicionar o conhecimento
-    ao banco de dados de vetores no Pinecone.
-    """
     if file.content_type != 'application/pdf':
         raise HTTPException(status_code=400, detail="Tipo de arquivo inválido. Por favor, envie um PDF.")
-
     try:
-        # Salva o arquivo enviado em um local temporário para poder ser lido.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Usa as funções de apoio para processar o PDF.
-        raw_text = processar_texto_de_pdf(tmp_path)
-        chunks = criar_chunks(raw_text)
-
-        # Adiciona os textos processados ao índice do Pinecone.
-        # O LangChain lida com a criação dos embeddings e o envio.
-        Pinecone.from_texts(texts=chunks, embedding=embeddings, index_name=PINECONE_INDEX_NAME)
-
-        # Apaga o arquivo temporário após o uso.
+        raw_text = process_pdf_text(tmp_path)
+        chunks = create_text_chunks(raw_text)
+        Pinecone.from_texts(texts=chunks, embedding=embeddings_model, index_name=PINECONE_INDEX_NAME)
         os.remove(tmp_path)
 
         return {"status": "sucesso", "filename": file.filename,
                 "message": "Documento processado e adicionado à base de conhecimento."}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ocorreu um erro inesperado: {str(e)}")
 
 
-# Define o formato esperado para a requisição de pergunta
 class QuestionRequest(BaseModel):
     question: str
     chat_history: list = []
 
 
-@app.post("/ask/")
+@app.post("/ask/", dependencies=[Depends(api_key_auth)])
 def ask_question(request: QuestionRequest):
-    """
-    Endpoint para receber uma pergunta, buscar o contexto no Pinecone,
-    e gerar uma resposta com o Gemini.
-    """
     try:
-        # Conecta ao índice Pinecone que já existe.
-        vectorstore = Pinecone.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
-
-        # Cria a cadeia de conversação para esta requisição específica.
+        vectorstore = Pinecone.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings_model)
         memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True, output_key='answer')
         conversation_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
@@ -115,11 +89,7 @@ def ask_question(request: QuestionRequest):
             memory=memory,
             return_source_documents=True
         )
-
-        # Executa a cadeia com a pergunta e o histórico para obter a resposta.
         response = conversation_chain({'question': request.question, 'chat_history': request.chat_history})
-        answer = response['answer']
-
-        return {"answer": answer}
+        return {"answer": response['answer']}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ocorreu um erro ao processar a pergunta: {str(e)}")
