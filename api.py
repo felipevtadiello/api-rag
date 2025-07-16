@@ -79,8 +79,16 @@ async def upload_and_process(file: UploadFile = File(...)):
 
         raw_text = process_pdf_text(tmp_path)
         chunks = create_text_chunks(raw_text)
-        Pinecone.from_texts(texts=chunks, embedding=embeddings_model, index_name=PINECONE_INDEX_NAME,
-                            metadata={"source": file.filename})
+
+        metadatas = [{"source": file.filename} for _ in chunks]
+
+        Pinecone.from_texts(
+            texts=chunks,
+            embedding=embeddings_model,
+            index_name=PINECONE_INDEX_NAME,
+            metadatas=metadatas
+        )
+
         os.remove(tmp_path)
 
         processed_docs.append(file.filename)
@@ -88,7 +96,9 @@ async def upload_and_process(file: UploadFile = File(...)):
 
         return {"status": "sucesso", "filename": file.filename, "message": "Documento processado e adicionado."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ocorreu um erro: {str(e)}")
+        error_message = str(e)
+        print(f"Erro detalhado: {error_message}")
+        raise HTTPException(status_code=500, detail=f"Ocorreu um erro: {error_message}")
 
 
 @app.get("/list-documents/", response_model=List[str], dependencies=[Depends(api_key_auth)])
