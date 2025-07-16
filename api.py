@@ -1,10 +1,10 @@
 import os
 import tempfile
+import json
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
-from typing import Annotated
+from typing import Annotated, List
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -17,9 +17,9 @@ load_dotenv()
 os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 os.environ["PINECONE_API_KEY"] = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-
 API_KEY = os.getenv("API_BACKEND_KEY")
 API_KEY_NAME = "X-Api-Key"
+DOCS_LOG_FILE = "processed_docs.json"
 
 api_key_header_scheme = Header(alias=API_KEY_NAME)
 
@@ -31,8 +31,19 @@ async def api_key_auth(x_api_key: Annotated[str, api_key_header_scheme]):
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.5)
+app = FastAPI(title="API do Chat RAG Segura")
 
-app = FastAPI(title="RAG Chat API")
+
+def load_processed_docs() -> List[str]:
+    if os.path.exists(DOCS_LOG_FILE):
+        with open(DOCS_LOG_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_processed_docs(docs_list: List[str]):
+    with open(DOCS_LOG_FILE, "w") as f:
+        json.dump(docs_list, f, indent=4)
 
 
 def process_pdf_text(pdf_file):
@@ -56,21 +67,33 @@ def create_text_chunks(full_text):
 @app.post("/upload-and-process/", dependencies=[Depends(api_key_auth)])
 async def upload_and_process(file: UploadFile = File(...)):
     if file.content_type != 'application/pdf':
-        raise HTTPException(status_code=400, detail="Tipo de arquivo inválido. Por favor, envie um PDF.")
+        raise HTTPException(status_code=400, detail="Tipo de arquivo inválido.")
     try:
+        processed_docs = load_processed_docs()
+        if file.filename in processed_docs:
+            raise HTTPException(status_code=400, detail=f"O arquivo '{file.filename}' já foi processado.")
+
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(await file.read())
             tmp_path = tmp.name
 
         raw_text = process_pdf_text(tmp_path)
         chunks = create_text_chunks(raw_text)
-        Pinecone.from_texts(texts=chunks, embedding=embeddings_model, index_name=PINECONE_INDEX_NAME)
+        Pinecone.from_texts(texts=chunks, embedding=embeddings_model, index_name=PINECONE_INDEX_NAME,
+                            metadata={"source": file.filename})
         os.remove(tmp_path)
 
-        return {"status": "sucesso", "filename": file.filename,
-                "message": "Documento processado e adicionado à base de conhecimento."}
+        processed_docs.append(file.filename)
+        save_processed_docs(processed_docs)
+
+        return {"status": "sucesso", "filename": file.filename, "message": "Documento processado e adicionado."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ocorreu um erro inesperado: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ocorreu um erro: {str(e)}")
+
+
+@app.get("/list-documents/", response_model=List[str], dependencies=[Depends(api_key_auth)])
+def list_documents():
+    return load_processed_docs()
 
 
 class QuestionRequest(BaseModel):
