@@ -5,6 +5,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Header
 from typing import Annotated, List
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -66,7 +67,6 @@ def process_pdf_text(pdf_file):
 def create_text_chunks(full_text):
     text_splitter = CharacterTextSplitter(separator='\n', chunk_size=1000, chunk_overlap=200, length_function=len)
     return text_splitter.split_text(full_text)
-
 
 
 @app.post("/upload-and-process/", dependencies=[Depends(api_key_auth)])
