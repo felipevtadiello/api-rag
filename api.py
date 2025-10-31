@@ -10,6 +10,9 @@ from langchain.text_splitter import CharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_pinecone import Pinecone as LangchainPinecone
 from langchain.chains import ConversationalRetrievalChain
+from sqlalchemy.orm import Session
+from database import get_db, ChatLog
+from sqlalchemy import func
 import pinecone
 
 load_dotenv()
@@ -24,12 +27,60 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 
 embeddings_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.5)
-app = FastAPI(title="API do Chat RAG Robusta")
+app = FastAPI(title="API do Chat RAG")
 
 api_key_header_scheme = Header(alias=API_KEY_NAME)
 async def api_key_auth(x_api_key: Annotated[str, api_key_header_scheme]):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Chave de API inválida ou ausente")
+
+from sqlalchemy import func
+
+class StatsOverview(BaseModel):
+    total_questions: int
+    total_courses: int
+    total_vectors: int
+
+@app.get("/stats/overview", response_model=StatsOverview, dependencies=[Depends(api_key_auth)])
+def get_stats_overview(db: Session = Depends(get_db)):
+    try:
+        total_questions = db.query(func.count(ChatLog.id)).scalar()
+        
+        total_courses = len(list_courses()) 
+        
+        index_stats = pinecone_index.describe_index_stats()
+        total_vectors = index_stats.get('total_vector_count', 0)
+        
+        return {
+            "total_questions": total_questions,
+            "total_courses": total_courses,
+            "total_vectors": total_vectors
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar stats: {str(e)}")
+
+
+@app.get("/stats/questions-by-course", dependencies=[Depends(api_key_auth)])
+def get_questions_by_course(db: Session = Depends(get_db)):
+    try:
+        result = db.query(
+            ChatLog.course, 
+            func.count(ChatLog.id).label('question_count')
+        ).group_by(ChatLog.course).order_by(func.count(ChatLog.id).desc()).all()
+        
+        return {row[0]: row[1] for row in result}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar stats por curso: {str(e)}")
+
+
+@app.get("/stats/recent-questions", dependencies=[Depends(api_key_auth)])
+def get_recent_questions(limit: int = 20, db: Session = Depends(get_db)):
+    try:
+        logs = db.query(ChatLog).order_by(ChatLog.timestamp.desc()).limit(limit).all()
+        return logs 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao buscar perguntas recentes: {str(e)}")
 
 def process_pdf_text(pdf_path):
     full_text = ""
@@ -169,7 +220,7 @@ class QuestionRequest(BaseModel):
 
 
 @app.post("/ask/", dependencies=[Depends(api_key_auth)])
-def ask_question(request: QuestionRequest):
+def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     try:
         vectorstore = LangchainPinecone.from_existing_index(
             index_name=PINECONE_INDEX_NAME, 
@@ -198,6 +249,18 @@ def ask_question(request: QuestionRequest):
             'question': request.question, 
             'chat_history': formatted_history
         })
+
+        try:
+            new_log = ChatLog(
+                course=request.course,
+                question=request.question,
+                answer=response['answer']
+            )
+            db.add(new_log)
+            db.commit()
+        except Exception as e:
+            print(f"Erro ao salvar log no DB: {e}") 
+            db.rollback()
 
         
         source_documents_formatted = []
