@@ -14,3 +14,7 @@ docx2txt
 chardet
 sqlalchemy
 psycopg2-binary
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+bcrypt==4.0.1
